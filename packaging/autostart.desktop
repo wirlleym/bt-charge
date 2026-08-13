@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BT Charge
+Comment=Monitor de bateria de headsets Bluetooth na bandeja do sistema
+Exec=/usr/bin/bt-charge
+Icon=bt-charge-emoji
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3

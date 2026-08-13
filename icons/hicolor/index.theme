@@ -1,0 +1,12 @@
+[Icon Theme]
+Name=hicolor
+Comment=Ícones do BT Charge
+Directories=22x22,44x44
+
+[22x22]
+Size=22
+Type=Fixed
+
+[44x44]
+Size=44
+Type=Fixed

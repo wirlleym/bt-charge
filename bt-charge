@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+BT Charge — monitor de bateria de headsets Bluetooth na bandeja do sistema.
+
+Consulta o nível de bateria dos fones pareados via D-Bus (BlueZ), de forma
+assíncrona, e exibe na bandeja um ícone 🎧 seguido da porcentagem:
+
+    [🎧] 100%   um fone conectado (percentual dele)
+    [🎧] 64%    vários conectados — mostra o MENOR percentual
+    [🎧]        nenhum fone conectado
+    [🎧] --     conectado, mas sem bateria disponível
+
+Eventos do BlueZ (PropertiesChanged / InterfacesAdded / InterfacesRemoved)
+atualizam a interface imediatamente; uma consulta periódica de segurança
+roda a cada N segundos (padrão: 30) sem bloquear a interface.
+
+Dispositivos monitorados ficam em ~/.config/bt-charge/config.json.
+Novos fones pareados (headsets de áudio) são detectados e adicionados
+automaticamente quando auto_add_devices está habilitado.
+
+Uso:
+    bt-charge            executa o indicador na bandeja
+    bt-charge --check    consulta o estado uma vez e sai (sem bandeja)
+    bt-charge --discover lista os dispositivos pareados classificados e sai
+"""
+
+from __future__ import annotations
+
+import argparse
+import dbus
+import fcntl
+import json
+import logging
+import os
+import signal
+import sys
+import time
+
+# --------------------------------------------------------------------------
+# Constantes BlueZ
+# --------------------------------------------------------------------------
+BLUEZ = "org.bluez"
+OM_IFACE = "org.freedesktop.DBus.ObjectManager"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+DEV_IFACE = "org.bluez.Device1"
+BAT_IFACE = "org.bluez.Battery1"
+
+# UUIDs usados para classificar fones (exclui mouse, teclado, caixa de som...)
+UUID_AUDIO_SINK = "0000110b"
+UUID_HFP = "0000111e"            # Handsfree (perfil de headset com microfone)
+UUID_AVRCP_TARGET = "0000110c"   # AVRCP Target (fonte típica do nível de bateria)
+
+EMOJI = "\U0001F3A7"  # 🎧
+
+# --------------------------------------------------------------------------
+# Configuração
+# --------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "poll_interval": 30,       # consulta periódica de segurança (segundos)
+    "auto_add_devices": True,  # adiciona automaticamente novos fones pareados
+    "devices": [],             # [{"mac": "...", "name": "..."}]
+}
+
+
+def _config_dir() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "bt-charge")
+
+
+def _state_dir() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "bt-charge")
+
+
+CONFIG_FILE = os.path.join(_config_dir(), "config.json")
+LOG_FILE = os.path.join(_state_dir(), "bt-charge.log")
+
+
+def load_config() -> dict:
+    cfg = {"poll_interval": DEFAULT_CONFIG["poll_interval"],
+           "auto_add_devices": DEFAULT_CONFIG["auto_add_devices"],
+           "devices": []}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            if isinstance(data.get("poll_interval"), (int, float)):
+                cfg["poll_interval"] = int(data["poll_interval"])
+            if isinstance(data.get("auto_add_devices"), bool):
+                cfg["auto_add_devices"] = data["auto_add_devices"]
+            devs = data.get("devices")
+            if isinstance(devs, list):
+                for d in devs:
+                    if isinstance(d, dict) and d.get("mac"):
+                        cfg["devices"].append(
+                            {"mac": str(d["mac"]).upper(),
+                             "name": str(d.get("name") or d["mac"])})
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, OSError) as exc:
+        logging.error("config inválida (%s); usando padrão", exc)
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp, CONFIG_FILE)
+    except OSError as exc:
+        logging.error("não foi possível salvar a config: %s", exc)
+
+
+def _setup_logging() -> None:
+    handlers = [logging.StreamHandler(sys.stderr)]
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        handlers.append(logging.FileHandler(LOG_FILE, encoding="utf-8"))
+    except OSError:
+        pass
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s BT-Charge %(message)s",
+                        handlers=handlers)
+
+
+# --------------------------------------------------------------------------
+# Modelo de dispositivo
+# --------------------------------------------------------------------------
+class Device:
+    """Fone Bluetooth monitorado. O MAC é a identidade; nome/alias é exibição."""
+
+    __slots__ = ("mac", "name", "alias", "connected", "battery",
+                 "last_update", "available")
+
+    def __init__(self, mac: str, name: str | None = None, alias: str = ""):
+        self.mac = mac
+        self.name = name or alias or mac
+        self.alias = alias
+        self.connected = False
+        self.battery = None       # int 0..100 ou None (desconhecido)
+        self.last_update = None   # timestamp (epoch) da última bateria lida
+        self.available = True     # ainda pareado/presente no BlueZ
+
+    def battery_text(self) -> str:
+        return f"{self.battery}%" if self.battery is not None else "--"
+
+    def status_text(self) -> str:
+        return "Conectado" if self.connected else "Desconectado"
+
+
+# --------------------------------------------------------------------------
+# Utilidades BlueZ
+# --------------------------------------------------------------------------
+def _norm_uuid(u) -> str:
+    return str(u).lower().replace("-", "")
+
+
+def _mac_from_path(path) -> str | None:
+    """/org/bluez/hci0/dev_41_42_B6_19_4A_A0 -> 41:42:B6:19:4A:A0"""
+    tail = str(path).rsplit("/", 1)[-1]
+    if tail.startswith("dev_"):
+        return tail[4:].replace("_", ":").upper()
+    return None
+
+
+def is_headset(props: dict) -> bool:
+    """Classifica um dispositivo como fone/headset de áudio.
+
+    Regra: precisa ter o perfil Audio Sink (reprodução de áudio) e, além
+    disso, HFP (mãos-livres) ou AVRCP Target — que é o que tipicamente
+    expõe o nível de bateria. Dispositivos com apenas Audio Sink (ex.:
+    caixas de som) e não-áudio (mouse, teclado, celular...) são ignorados.
+    """
+    uuids = {_norm_uuid(u) for u in (props.get("UUIDs") or [])}
+    has_sink = any(UUID_AUDIO_SINK in u for u in uuids)
+    if not has_sink:
+        return False
+    has_hfp_or_avrcp = any((UUID_HFP in u) or (UUID_AVRCP_TARGET in u)
+                           for u in uuids)
+    return has_hfp_or_avrcp
+
+
+# --------------------------------------------------------------------------
+# Aplicação (bandeja)
+# --------------------------------------------------------------------------
+class BTChargeApp:
+    def __init__(self):
+        self.config = load_config()
+        self.devices: dict[str, Device] = {}
+        for d in self.config["devices"]:
+            self.devices[d["mac"]] = Device(d["mac"], name=d["name"])
+        self._busy = False
+        self._config_dirty = False
+        # O rótulo (XAyatanaLabel) é propriedade OPCIONAL do StatusNotifierItem:
+        # a extensão da bandeja só o sincroniza quando ele MUDA após a conexão.
+        # Por isso o label só passa a ser definido ~3s após o início (ver
+        # _enable_labels) — se fosse setado antes, a extensão nunca o veria.
+        self._labels_ready = False
+        self.loop = None
+
+        self._acquire_lock()
+        self.bus = dbus.SystemBus()
+        self.om = dbus.Interface(self.bus.get_object(BLUEZ, "/"), OM_IFACE)
+
+        self._setup_indicator()
+        self._setup_signals()
+        self.refresh()
+
+    # ------------------------------------------------------------------ #
+    # Instância única
+    # ------------------------------------------------------------------ #
+    def _acquire_lock(self) -> None:
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+        self._lock_path = os.path.join(runtime, "bt-charge.lock")
+        self._lock_fd = open(self._lock_path, "w", encoding="utf-8")
+        try:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            logging.error("outra instância do BT Charge já está em execução")
+            sys.exit(1)
+        self._lock_fd.write(str(os.getpid()))
+        self._lock_fd.flush()
+
+    def _release_lock(self) -> None:
+        try:
+            self._lock_fd.close()
+            os.unlink(self._lock_path)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Bandeja
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _icon_theme_dir() -> str | None:
+        """Diretório do tema de ícones com o PNG do 🎧.
+
+        Procura primeiro no diretório do usuário (instalação manual) e
+        depois no de sistema (pacote .deb). Retorna None se não achar —
+        nesse caso usa o ícone de tema genérico 'audio-headset' como
+        fallback (nunca fica sem ícone, o que faria o GNOME mostrar '…').
+        """
+        base = (os.environ.get("XDG_DATA_HOME")
+                or os.path.expanduser("~/.local/share"))
+        for theme in (os.path.join(base, "bt-charge", "icons"),
+                      "/usr/share/bt-charge/icons"):
+            # O tema hicolor/ dentro do diretório é o que o Gtk/St.IconTheme
+            # enxerga via search_path (procura por <path>/<tema>/...).
+            if os.path.isfile(os.path.join(theme, "hicolor", "index.theme")):
+                return theme
+        return None
+
+    def _setup_indicator(self) -> None:
+        # Um único ícone (o 🎧 como pixmap) + rótulo com a porcentagem:
+        # evita o ícone duplicado e o placeholder '…' do GNOME para itens
+        # sem ícone.
+        theme = self._icon_theme_dir()
+        # Cria sem ícone, define o tema e SÓ ENTÃO seta o nome — mudar o
+        # nome força a ayatana a resolver o ícone no tema e exportar o
+        # IconPixmap (sem isso, o item fica só com IconName e o GNOME pode
+        # não renderizar).
+        self.indicator = AyatanaAppIndicator3.Indicator.new(
+            "bt-charge",
+            "",
+            AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+        if theme:
+            self.indicator.set_icon_theme_path(theme)
+            self.indicator.set_icon("bt-charge-emoji")
+        else:
+            self.indicator.set_icon("audio-headset")
+        self.menu = Gtk.Menu()
+        self.indicator.set_menu(self.menu)
+
+    def _tray_label(self) -> str:
+        """Rótulo = só a porcentagem (o 🎧 é o ícone):
+        '' (nenhum conectado), '--' (conectado sem bateria) ou 'NN%'
+        (menor percentual entre os conectados)."""
+        conn = [d for d in self.devices.values() if d.available and d.connected]
+        if not conn:
+            return ""  # só o ícone do fone, sem porcentagem
+        batteries = [d.battery for d in conn if d.battery is not None]
+        if not batteries:
+            return "--"  # conectado, mas sem bateria disponível
+        # Um ou vários conectados: mostra o MENOR percentual (o mais crítico).
+        return f"{min(batteries)}%"
+
+    def _summary(self) -> str:
+        conn = [d for d in self.devices.values() if d.available and d.connected]
+        if not conn:
+            return "nenhum fone conectado"
+        return "; ".join(f"{d.name}: {d.battery_text()}" for d in conn)
+
+    def _rebuild_menu(self) -> None:
+        for child in self.menu.get_children():
+            self.menu.remove(child)
+
+        # O menu lista apenas os fones CONECTADOS no momento.
+        devs = [d for d in self.devices.values() if d.available and d.connected]
+        if not devs:
+            empty_item = Gtk.MenuItem(label="Nenhum fone conectado")
+            empty_item.set_sensitive(False)
+            self.menu.append(empty_item)
+
+        for i, dev in enumerate(devs):
+            if i:
+                self.menu.append(Gtk.SeparatorMenuItem())
+            name_item = Gtk.MenuItem(label=dev.name)
+            name_item.set_sensitive(False)
+            self.menu.append(name_item)
+
+            status_item = Gtk.MenuItem(label=dev.status_text())
+            status_item.set_sensitive(False)
+            self.menu.append(status_item)
+
+            batt_item = Gtk.MenuItem(label=f"Bateria: {dev.battery_text()}")
+            batt_item.set_sensitive(False)
+            self.menu.append(batt_item)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        refresh_item = Gtk.MenuItem(label="Atualizar agora")
+        refresh_item.connect("activate", lambda *_: self.refresh())
+        self.menu.append(refresh_item)
+
+        quit_item = Gtk.MenuItem(label="Sair")
+        quit_item.connect("activate", lambda *_: self.quit())
+        self.menu.append(quit_item)
+
+        self.menu.show_all()
+        # clique do meio (em desktops que suportam) = atualizar
+        try:
+            self.indicator.set_secondary_activate_target(refresh_item)
+        except Exception:
+            pass
+
+    def _update_ui(self) -> None:
+        try:
+            if self._labels_ready:
+                self.indicator.set_label(self._tray_label(), "")
+            self.indicator.set_title(f"BT Charge — {self._summary()}")
+            self._rebuild_menu()
+        except Exception as exc:
+            logging.exception("erro ao atualizar a interface: %s", exc)
+
+    def _enable_labels(self) -> bool:
+        """Libera o rótulo depois que a extensão da bandeja conectou."""
+        self._labels_ready = True
+        self._update_ui()
+        return False  # timer de uso único
+
+    # ------------------------------------------------------------------ #
+    # Sinais BlueZ (eventos de conexão/desconexão/bateria)
+    # ------------------------------------------------------------------ #
+    def _setup_signals(self) -> None:
+        # Mudanças de propriedade do Device1 (Connected, Paired, Alias...)
+        # e do Battery1 (Percentage) — atualização imediata, sem esperar o poll.
+        for iface in (DEV_IFACE, BAT_IFACE):
+            self.bus.add_signal_receiver(
+                self._on_properties_changed,
+                signal_name="PropertiesChanged",
+                dbus_interface=PROPS_IFACE,
+                path_keyword="path",
+                arg0=iface,
+                bus_name=BLUEZ,
+            )
+        # Interfaces que aparecem (ex.: Battery1 ao conectar; novo dispositivo)
+        self.bus.add_signal_receiver(
+            self._on_interfaces_added,
+            signal_name="InterfacesAdded",
+            dbus_interface=OM_IFACE,
+            path_keyword="path",
+            bus_name=BLUEZ,
+        )
+        # Interfaces removidas (ex.: dispositivo despareado)
+        self.bus.add_signal_receiver(
+            self._on_interfaces_removed,
+            signal_name="InterfacesRemoved",
+            dbus_interface=OM_IFACE,
+            path_keyword="path",
+            bus_name=BLUEZ,
+        )
+
+    def _on_properties_changed(self, iface, changed, invalidated, path=None):
+        mac = _mac_from_path(path or "")
+        dev = self.devices.get(mac)
+        if dev is None:
+            return
+        try:
+            dirty = False
+            if iface == DEV_IFACE:
+                if "Connected" in changed:
+                    dev.connected = bool(changed["Connected"])
+                    dirty = True
+                    if dev.connected:
+                        # A bateria costuma aparecer alguns instantes após a
+                        # conexão; agenda uma verificação extra.
+                        GLib.timeout_add_seconds(2, self._refresh_once)
+                if "Paired" in changed:
+                    dev.available = bool(changed["Paired"])
+                    dirty = True
+                if "Alias" in changed:
+                    dev.alias = str(changed["Alias"])
+            elif iface == BAT_IFACE:
+                if "Percentage" in changed:
+                    dev.battery = int(changed["Percentage"])
+                    dev.last_update = time.time()
+                    dirty = True
+            if dirty:
+                self._update_ui()
+        except Exception as exc:
+            # erros nunca podem derrubar o aplicativo
+            logging.exception("erro ao processar PropertiesChanged: %s", exc)
+
+    def _on_interfaces_added(self, interfaces_and_props, path=None):
+        if _mac_from_path(path or "") is None:
+            return
+        try:
+            self._refresh_once()
+        except Exception as exc:
+            logging.exception("erro em InterfacesAdded: %s", exc)
+
+    def _on_interfaces_removed(self, interfaces, path=None):
+        if DEV_IFACE not in interfaces:
+            return  # ex.: Battery1 sumiu ao desconectar; o refresh resolve
+        mac = _mac_from_path(path or "")
+        dev = self.devices.get(mac)
+        if dev is not None:
+            dev.available = False
+            dev.connected = False
+            dev.battery = None
+        try:
+            self._refresh_once()
+        except Exception as exc:
+            logging.exception("erro em InterfacesRemoved: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Consulta periódica (assíncrona, não bloqueia a interface)
+    # ------------------------------------------------------------------ #
+    def refresh(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self.om.GetManagedObjects(reply_handler=self._on_objects,
+                                  error_handler=self._on_query_error)
+
+    def _refresh_once(self) -> bool:
+        self.refresh()
+        return False  # timer de uso único
+
+    def _poll(self) -> bool:
+        self.refresh()
+        return True  # mantém o timer periódico
+
+    def _on_query_error(self, exc) -> None:
+        self._busy = False
+        logging.warning("falha ao consultar o BlueZ: %s", exc)
+
+    def _on_objects(self, objects) -> None:
+        self._busy = False
+        try:
+            found = set()
+            for path, ifaces in objects.items():
+                if DEV_IFACE not in ifaces:
+                    continue
+                props = ifaces[DEV_IFACE]
+                mac = str(props.get("Address", "")).upper()
+                if not mac:
+                    continue
+
+                dev = self.devices.get(mac)
+                if dev is None:
+                    # Auto-descoberta: adiciona fones pareados não conhecidos
+                    if not self.config.get("auto_add_devices", True):
+                        continue
+                    if not bool(props.get("Paired", False)):
+                        continue
+                    if not is_headset(props):
+                        continue
+                    alias = str(props.get("Alias") or props.get("Name") or mac)
+                    dev = Device(mac, name=alias, alias=alias)
+                    self.devices[mac] = dev
+                    self._config_dirty = True
+                    logging.info("novo fone detectado: %s (%s)", alias, mac)
+
+                found.add(mac)
+                dev.alias = str(props.get("Alias") or "")
+                dev.connected = bool(props.get("Connected", False))
+                dev.available = bool(props.get("Paired", False))
+
+                # Bateria: Battery1 (BlueZ moderno) ou Device1.BatteryPercentage
+                battery = ifaces.get(BAT_IFACE, {}).get("Percentage")
+                if battery is None:
+                    battery = props.get("BatteryPercentage")
+                if battery is not None:
+                    dev.battery = int(battery)
+                    dev.last_update = time.time()
+                elif not dev.connected:
+                    dev.battery = None  # desconectado: sem bateria disponível
+
+            # Dispositivos do config que sumiram do BlueZ (ex.: despareados)
+            for mac in list(self.devices):
+                if mac not in found:
+                    dev = self.devices[mac]
+                    dev.available = False
+                    dev.connected = False
+                    dev.battery = None
+
+            self._persist_if_dirty()
+            self._update_ui()
+        except Exception as exc:
+            logging.exception("erro ao processar objetos BlueZ: %s", exc)
+
+    def _persist_if_dirty(self) -> None:
+        if not self._config_dirty:
+            return
+        cfg_names = {d["mac"]: d["name"] for d in self.config["devices"]}
+        devs = []
+        for mac, dev in self.devices.items():
+            name = cfg_names.get(mac) or dev.name or dev.alias or mac
+            devs.append({"mac": mac, "name": name})
+        self.config["devices"] = devs
+        save_config(self.config)
+        self._config_dirty = False
+
+    # ------------------------------------------------------------------ #
+    # Ciclo de vida
+    # ------------------------------------------------------------------ #
+    def run(self) -> None:
+        self.loop = GLib.MainLoop()
+        interval = max(10, int(self.config.get("poll_interval", 30)))
+        GLib.timeout_add_seconds(interval, self._poll)
+        GLib.timeout_add_seconds(3, self._enable_labels)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.quit)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self.quit)
+        try:
+            self.loop.run()
+        finally:
+            self._release_lock()
+
+    def quit(self, *args) -> bool:
+        if self.loop is not None:
+            self.loop.quit()
+        return False
+
+
+# --------------------------------------------------------------------------
+# Modo CLI (--check / --discover)
+# --------------------------------------------------------------------------
+def cli_query(discover: bool) -> int:
+    try:
+        bus = dbus.SystemBus()
+        om = dbus.Interface(bus.get_object(BLUEZ, "/"), OM_IFACE)
+        objects = om.GetManagedObjects()  # síncrono OK em modo CLI
+    except dbus.DBusException as exc:
+        print(f"erro: não foi possível falar com o BlueZ: {exc}", file=sys.stderr)
+        return 2
+
+    rows = []
+    for path, ifaces in objects.items():
+        if DEV_IFACE not in ifaces:
+            continue
+        props = ifaces[DEV_IFACE]
+        if not bool(props.get("Paired", False)):
+            continue
+        mac = str(props.get("Address", ""))
+        alias = str(props.get("Alias") or props.get("Name") or mac)
+        connected = bool(props.get("Connected", False))
+        tipo = "fone" if is_headset(props) else "outro"
+        battery = ifaces.get(BAT_IFACE, {}).get("Percentage")
+        if battery is None:
+            battery = props.get("BatteryPercentage")
+        bat = f"{int(battery)}%" if battery is not None else "--"
+        rows.append((mac, alias, tipo,
+                     "conectado" if connected else "desconectado", bat))
+
+    rows.sort(key=lambda r: (r[2] != "fone", r[0]))
+    print(f"{'MAC':<20} {'NOME':<22} {'TIPO':<6} {'ESTADO':<13} BATERIA")
+    print("-" * 72)
+    for mac, alias, tipo, estado, bat in rows:
+        print(f"{mac:<20} {alias:<22} {tipo:<6} {estado:<13} {bat}")
+
+    fones = [r for r in rows if r[2] == "fone"]
+    print()
+    if not fones:
+        print("Nenhum fone pareado encontrado.")
+    else:
+        print(f"{len(fones)} fone(s) pareado(s).")
+        if discover:
+            print("\nSugestão de entrada para o config.json:")
+            print(json.dumps([{"mac": r[0], "name": r[1]} for r in fones],
+                             ensure_ascii=False, indent=2))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Entrada
+# --------------------------------------------------------------------------
+def run_gui() -> int:
+    """Só importa Gtk/AppIndicator no modo gráfico (mantém o CLI leve)."""
+    global AyatanaAppIndicator3, Gtk, GLib
+    try:
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import GLib, Gtk, AyatanaAppIndicator3  # noqa: F401
+        import dbus.mainloop.glib
+    except (ValueError, ImportError) as exc:
+        print(f"erro: {exc}", file=sys.stderr)
+        print("Instale os bindings do AppIndicator com:",
+              "sudo apt install gir1.2-ayatanaappindicator3-0.1",
+              file=sys.stderr)
+        return 3
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    _setup_logging()
+    app = BTChargeApp()
+    app.run()
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="BT Charge — monitor de bateria de headsets Bluetooth na bandeja")
+    parser.add_argument("--check", action="store_true",
+                        help="consulta o estado uma vez e sai (sem bandeja)")
+    parser.add_argument("--discover", action="store_true",
+                        help="lista os dispositivos pareados classificados e sai")
+    args = parser.parse_args()
+
+    if args.check or args.discover:
+        return cli_query(discover=args.discover)
+    return run_gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

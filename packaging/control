@@ -1,0 +1,17 @@
+Package: bt-charge
+Version: 1.0.0-1
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.9), python3-gi, python3-dbus, gir1.2-ayatanaappindicator3-0.1, gir1.2-gtk-3.0
+Maintainer: Wirlley Melo <wirlleym@users.noreply.github.com>
+Description: Monitor de bateria de headsets Bluetooth na bandeja do sistema
+ Indicador de bandeja (StatusNotifierItem) que consulta o nivel de bateria
+ dos fones Bluetooth pareados via D-Bus/BlueZ e mostra o percentual ao lado
+ do icone 🎧. Com varios fones conectados, exibe o MENOR percentual.
+ .
+ Recursos:
+  * consulta assincrona via D-Bus (nao bloqueia a interface);
+  * eventos de conexao/desconexao/bateria em tempo real + poll de seguranca;
+  * auto-descoberta de novos fones pareados (config em ~/.config/bt-charge);
+  * instancia unica; menu com "Atualizar agora" e "Sair".

@@ -1,0 +1,4 @@
+dist/
+packaging/_build/
+*.pyc
+__pycache__/
