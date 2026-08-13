@@ -16,7 +16,7 @@ lado do ícone 🎧:
 Baixe o `.deb` da página de [Releases](https://github.com/wirlleym/bt-charge/releases) e:
 
 ```bash
-sudo apt install ./bt-charge_1.0.0-1_all.deb
+sudo apt install ./bt-charge_1.0.1-2_all.deb
 ```
 
 O pacote instala as dependências automaticamente (`python3-gi`,
