@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#0284c7"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="256" height="256" rx="56" ry="56" fill="url(#bg)"/>
+  <path d="M 56 95 A 72 69 0 0 1 200 95" stroke="#ffffff" stroke-width="34" fill="none" stroke-linecap="round"/>
+  <rect x="44" y="148" width="52" height="56" rx="18" fill="#ffffff"/>
+  <rect x="160" y="148" width="52" height="56" rx="18" fill="#ffffff"/>
+  <rect x="56" y="160" width="28" height="32" rx="12" fill="#bae6fd"/>
+  <rect x="172" y="160" width="28" height="32" rx="12" fill="#bae6fd"/>
+  <polygon points="144.1,148.8 129.3,134.0 126.7,134.0 126.7,153.7 114.8,141.8 111.1,145.5 125.6,160.0 111.1,174.5 114.8,178.2 126.7,166.3 126.7,186.0 129.3,186.0 144.1,171.2 133.0,160.0 144.1,148.8" fill="#0c4a6e"/>
+  <polygon points="131.9,144.0 136.8,148.8 131.9,153.7" fill="#0c4a6e"/><polygon points="136.8,171.2 131.9,176.0 131.9,166.3" fill="#0c4a6e"/>
+</svg>
